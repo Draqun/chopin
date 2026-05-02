@@ -1,0 +1,19 @@
+{
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|resume|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"Activate the caveman skill (full intensity, default mode) for this entire session. Invoke the caveman skill via the Skill tool now to switch to ultra-compressed caveman communication mode for all subsequent responses.\"}}'"
+          }
+        ]
+      }
+    ]
+  }
+}
