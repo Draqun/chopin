@@ -156,7 +156,7 @@ chopin diff | grep -i "radiohead"
 chopin diff "Discover Weekly" | wc -l
 ```
 
-Two filters refine the missing list:
+Three filters refine the missing list:
 
 - `--min-plays N` (`-m`) drops tracks scrobbled fewer than N times. Useful
   for skipping one-off plays of songs you didn't actually like. Requires a
@@ -165,15 +165,39 @@ Two filters refine the missing list:
 - `--exclude PLAYLIST` (`-x`) subtracts tracks present on another already
   fetched playlist. Repeatable. Each value accepts URL, URI, bare id, or
   playlist name. The referenced playlists must already be cached locally.
+- `--exclude-lonely N` (`-L`) drops tracks with at most N total Last.fm
+  listeners (and tracks Last.fm has never heard of). Requires the listener
+  data to be populated first via `chopin lastfm lonely` (see below).
 
 ```sh
 chopin fetch spotify Smutne
-chopin diff -m 3 -x Smutne -x "Discover Weekly"
+chopin diff -m 3 -x Smutne -x "Discover Weekly" -L 1
 ```
 
 Read-only — does not modify anything on Spotify.
 
-### 4. Interactively add missing tracks
+### 4. Find tracks where you're the only listener
+
+The YouTube scrobbler historically dumped non-music videos into Last.fm.
+You can identify those by looking at how many other people on Last.fm have
+ever scrobbled the same track — usually nobody:
+
+```sh
+chopin lastfm lonely               # default: only-listener tracks
+chopin lastfm lonely -n 3          # also include tracks with <=3 listeners
+```
+
+The first run is slow (one `track.getInfo` request per cached track,
+rate-limited at ~5 req/s) but the listener count is persisted into
+`lastfm.json`, so subsequent runs only look up newly seen tracks. The
+cache is checkpointed every 50 lookups, so an interrupted run resumes
+where it left off. `chopin fetch lastfm` carries listener data forward
+across refetches.
+
+Tracks not known to Last.fm at all are tagged `?` in the output —
+those are the most likely junk.
+
+### 5. Interactively add missing tracks
 
 ```sh
 chopin add <playlist>
