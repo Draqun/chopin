@@ -9,3 +9,9 @@ build/
 .ruff_cache/
 .mypy_cache/
 uv.lock.bak
+
+# chopin scratch files (diff outputs, skipped lists, ad-hoc dumps)
+picks.json
+not_added.json
+plays.txt
+*.skipped.json
