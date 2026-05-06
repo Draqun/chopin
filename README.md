@@ -32,13 +32,59 @@ refresh by re-running `fetch`.
 
 ## Install
 
+There are two install modes. Pick the one that matches what you're doing.
+
+### A) Just use the tool (recommended for end users)
+
+Install `chopin` as a global CLI on your PATH (via `uv tool`):
+
 ```sh
-git clone <this repo> chopin
+git clone https://github.com/Draqun/chopin.git
 cd chopin
-uv sync           # or: python -m venv .venv && pip install -e .
+make init           # create dev venv + scaffold .env from template
+make install-cli    # build wheel and install ~/.local/bin/chopin globally
 ```
 
-This installs the `chopin` command into the project's virtualenv.
+After this, `chopin --help` works from any directory. Make sure
+`~/.local/bin` is on your `PATH`.
+
+To update later (pulls latest from GitHub `main` and reinstalls):
+
+```sh
+make update-cli
+# or a different branch:
+make update-cli REPO_BRANCH=experiments
+```
+
+To remove:
+
+```sh
+make uninstall-cli
+```
+
+### B) Develop on chopin
+
+If you're editing the source, you don't need a global install — just use
+the dev venv:
+
+```sh
+git clone https://github.com/Draqun/chopin.git
+cd chopin
+make init
+```
+
+Then run the CLI through `uv run` (or activate `.venv/`):
+
+```sh
+uv run chopin --help
+# or
+source .venv/bin/activate
+chopin --help
+```
+
+The Makefile targets (`make fetch-lastfm`, `make diff`, etc.) wrap
+`uv run chopin ...` so they always use the local source — handy while
+hacking on the code.
 
 ## Configure
 

@@ -7,8 +7,12 @@ PYTHON := uv run python
 PYTEST := uv run pytest
 CHOPIN := uv run chopin
 
-.PHONY: help init sync lock update test test-verbose \
-	fetch-lastfm fetch-spotify diff add data-dir \
+REPO_BRANCH ?= main
+GIT_REMOTE := git+ssh://git@github.com/Draqun/chopin.git
+
+.PHONY: help init sync lock update-deps test test-verbose \
+	fetch-lastfm fetch-spotify diff add lonely data-dir \
+	install-cli uninstall-cli update-cli build \
 	clean clean-cache clean-venv full-cleanup
 
 help: ## Show this help message
@@ -18,7 +22,7 @@ help: ## Show this help message
 
 # === Setup ===
 
-init: ## First-time setup: install deps and bootstrap .env from template
+init: ## First-time setup: create dev venv (uv sync) and bootstrap .env. Does NOT install the chopin command — see install-cli.
 	@if ! command -v uv >/dev/null 2>&1; then \
 		echo "error: uv is not installed. install from https://docs.astral.sh/uv/"; \
 		exit 1; \
@@ -34,15 +38,38 @@ init: ## First-time setup: install deps and bootstrap .env from template
 		echo ".env already exists, skipping copy"; \
 	fi
 
-sync: ## Re-install dependencies from lockfile
+sync: ## Re-install dev dependencies from lockfile
 	uv sync
 
 lock: ## Regenerate uv.lock without upgrading versions
 	uv lock
 
-update: ## Upgrade dependencies to latest compatible versions
+update-deps: ## Upgrade dev dependencies to latest compatible versions
 	uv lock --upgrade
 	uv sync
+
+# === CLI install ===
+
+build: ## Build a wheel into dist/
+	rm -rf dist/
+	uv build
+
+install-cli: build ## Install `chopin` globally via uv tool (from local build, ~/.local/bin/chopin)
+	@uv tool uninstall chopin >/dev/null 2>&1 || true
+	@wheel=$$(ls -t dist/chopin-*.whl 2>/dev/null | head -1); \
+	if [ -z "$$wheel" ]; then \
+		echo "error: no wheel found in dist/"; exit 1; \
+	fi; \
+	uv tool install --force "$$wheel"
+	@echo ""
+	@echo "installed. run 'chopin --help' (ensure ~/.local/bin is in PATH)"
+
+uninstall-cli: ## Remove the globally installed chopin
+	@uv tool uninstall chopin 2>/dev/null || echo "chopin was not installed"
+
+update-cli: ## Reinstall chopin globally from GitHub (REPO_BRANCH=main by default)
+	uv tool install --force "chopin @ $(GIT_REMOTE)@$(REPO_BRANCH)"
+	@echo "updated to latest from $(REPO_BRANCH)"
 
 # === Tests ===
 
@@ -72,6 +99,13 @@ diff: ## Show tracks missing from a playlist (vars: PLAYLIST, MIN_PLAYS, EXCLUDE
 		eval "$(CHOPIN) diff $$args"; \
 	else \
 		eval "$(CHOPIN) diff \"$(PLAYLIST)\" $$args"; \
+	fi
+
+lonely: ## List last.fm tracks where you are essentially the only listener (vars: MAX_LISTENERS=N)
+	@if [ -z "$(MAX_LISTENERS)" ]; then \
+		$(CHOPIN) lastfm lonely; \
+	else \
+		$(CHOPIN) lastfm lonely --max-listeners $(MAX_LISTENERS); \
 	fi
 
 add: ## Interactively add missing tracks (usage: make add PLAYLIST=<url|uri|id>)

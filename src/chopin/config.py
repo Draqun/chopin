@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
+from platformdirs import user_config_dir
 
 
 class ConfigError(Exception):
@@ -30,14 +32,33 @@ _REQUIRED = (
 )
 
 
+def _candidate_dotenvs() -> list[Path]:
+    """.env files to try, in priority order: explicit env, project-relative, user config."""
+    paths: list[Path] = []
+    explicit = os.environ.get("CHOPIN_DOTENV")
+    if explicit:
+        paths.append(Path(explicit))
+    # walk up from CWD looking for a .env (works when run from the project)
+    found = find_dotenv(usecwd=True)
+    if found:
+        paths.append(Path(found))
+    # global config: e.g. ~/.config/chopin/.env on Linux
+    paths.append(Path(user_config_dir("chopin")) / ".env")
+    return paths
+
+
 def load_config() -> Config:
-    load_dotenv()
+    for candidate in _candidate_dotenvs():
+        if candidate.is_file():
+            load_dotenv(candidate, override=False)
+            break
     missing = [k for k in _REQUIRED if not os.environ.get(k)]
     if missing:
         joined = ", ".join(missing)
         raise ConfigError(
-            f"missing in .env: {joined}\n"
-            "copy .env.example to .env and fill in credentials"
+            f"missing credentials: {joined}\n"
+            "set them via environment variables, CHOPIN_DOTENV=/path/to/.env, "
+            f"a project-local .env, or {Path(user_config_dir('chopin')) / '.env'}"
         )
     return Config(
         lastfm_api_key=os.environ["LASTFM_API_KEY"],

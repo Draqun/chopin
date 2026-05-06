@@ -20,7 +20,9 @@ from chopin.matching import Track, diff_tracks, normalize_key
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
 fetch_app = typer.Typer(no_args_is_help=True, help="Fetch data from Last.fm or Spotify")
+lastfm_app = typer.Typer(no_args_is_help=True, help="Last.fm utilities")
 app.add_typer(fetch_app, name="fetch")
+app.add_typer(lastfm_app, name="lastfm")
 
 
 def _die(msg: str) -> "typer.Exit":
@@ -102,22 +104,30 @@ class Spinner:
             sys.stderr.flush()
 
 
-def _load_lastfm_or_die() -> tuple[list[Track], bool]:
-    """Return (tracks, has_playcount). has_playcount=False for legacy caches."""
+def _load_lastfm_or_die() -> tuple[list[Track], bool, bool]:
+    """Return (tracks, has_playcount, has_listeners).
+
+    has_playcount/has_listeners are False for caches without those columns
+    (older fetches, or before `chopin lastfm lonely` was run).
+    """
     data = storage.load_json(storage.lastfm_path())
     if data is None:
         raise _die("no last.fm cache found. run `chopin fetch lastfm` first.")
     has_playcount = bool(data["tracks"]) and "playcount" in data["tracks"][0]
+    has_listeners = any(
+        t.get("listeners") is not None for t in data.get("tracks") or []
+    )
     tracks = [
         Track(
             artist=t["artist"],
             title=t["title"],
             album=t.get("album"),
             playcount=t.get("playcount"),
+            listeners=t.get("listeners"),
         )
         for t in data["tracks"]
     ]
-    return tracks, has_playcount
+    return tracks, has_playcount, has_listeners
 
 
 def _load_spotify_or_die(playlist_id: str) -> tuple[dict, list[Track]]:
@@ -159,6 +169,12 @@ def _resolve_playlist(
 def fetch_lastfm() -> None:
     """Fetch full scrobble history from Last.fm."""
     config = _config_or_die()
+    old = storage.load_json(storage.lastfm_path()) or {}
+    old_listeners = {
+        normalize_key(t["artist"], t["title"]): t.get("listeners")
+        for t in (old.get("tracks") or [])
+        if t.get("listeners") is not None
+    }
     started = time.monotonic()
     with Spinner(f"fetching scrobbles for {config.lastfm_user}") as spin:
         def progress(done: int, total: int) -> None:
@@ -171,12 +187,137 @@ def fetch_lastfm() -> None:
             progress=progress,
             log=spin.log,
         )
+    if old_listeners:
+        carried = 0
+        for t in payload["tracks"]:
+            key = normalize_key(t["artist"], t["title"])
+            if key in old_listeners:
+                t["listeners"] = old_listeners[key]
+                carried += 1
+        if carried:
+            typer.echo(
+                f"carried over listener counts for {carried} known tracks",
+                err=True,
+            )
     storage.save_json(storage.lastfm_path(), payload)
     elapsed = time.monotonic() - started
     typer.echo(
         f"fetched {payload['count']} unique tracks in {elapsed:.1f}s "
         f"→ {storage.lastfm_path()}"
     )
+
+
+_LISTENER_CHECKPOINT_EVERY = 50
+
+
+@lastfm_app.command("lonely")
+def lastfm_lonely(
+    max_listeners: int = typer.Option(
+        1,
+        "--max-listeners",
+        "-n",
+        min=1,
+        help="Print tracks where total last.fm listeners is at most N (default 1).",
+    ),
+) -> None:
+    """List tracks where you are (essentially) the only listener.
+
+    Fills missing `listeners` counts in the cache via track.getInfo. The
+    cache is checkpointed periodically so an interrupted run resumes.
+    """
+    config = _config_or_die()
+    data = storage.load_json(storage.lastfm_path())
+    if data is None:
+        raise _die("no last.fm cache found. run `chopin fetch lastfm` first.")
+    tracks = data.get("tracks") or []
+    if not tracks:
+        typer.echo("last.fm cache is empty", err=True)
+        return
+
+    missing = [t for t in tracks if t.get("listeners") is None]
+    typer.echo(
+        f"{len(tracks)} tracks total; {len(missing)} need a listener lookup",
+        err=True,
+    )
+
+    if missing:
+        rate = lastfm_mod._PER_REQUEST_DELAY
+        eta_min = (len(missing) * rate) / 60
+        typer.echo(
+            f"estimated wall time: ~{eta_min:.1f} min (rate-limited at "
+            f"{1 / rate:.0f} req/s)",
+            err=True,
+        )
+        with Spinner("fetching listener counts") as spin:
+            for i, t in enumerate(missing, 1):
+                spin.update(
+                    f"{i}/{len(missing)}: {t['artist']} — {t['title']}"
+                )
+                try:
+                    listeners = lastfm_mod.get_track_listeners(
+                        config.lastfm_api_key, t["artist"], t["title"]
+                    )
+                except RuntimeError as e:
+                    spin.log(f"error: {e} — saving and aborting")
+                    storage.save_json(storage.lastfm_path(), data)
+                    raise _die(str(e)) from e
+                t["listeners"] = listeners
+                if i % _LISTENER_CHECKPOINT_EVERY == 0:
+                    storage.save_json(storage.lastfm_path(), data)
+                    spin.log(
+                        f"checkpoint: {i}/{len(missing)} written to cache"
+                    )
+        storage.save_json(storage.lastfm_path(), data)
+
+    lonely = [
+        t
+        for t in tracks
+        if t.get("listeners") is not None
+        and t["listeners"] != lastfm_mod.TRACK_UNKNOWN
+        and t["listeners"] <= max_listeners
+    ]
+    unknown = [
+        t
+        for t in tracks
+        if t.get("listeners") == lastfm_mod.TRACK_UNKNOWN
+    ]
+
+    typer.echo(
+        f"{len(lonely)} lonely tracks (<= {max_listeners} listener(s)), "
+        f"{len(unknown)} unknown to last.fm",
+        err=True,
+    )
+    if unknown:
+        typer.echo(
+            "(unknown = last.fm has no entry for the artist/title — "
+            "almost certainly junk)",
+            err=True,
+        )
+
+    rows = lonely + unknown
+    rows.sort(
+        key=lambda t: (
+            t.get("listeners")
+            if t.get("listeners") is not None
+            and t["listeners"] != lastfm_mod.TRACK_UNKNOWN
+            else -1,
+            -(t.get("playcount") or 0),
+            t["artist"].lower(),
+            t["title"].lower(),
+        )
+    )
+    for t in rows:
+        listeners = t.get("listeners")
+        marker = (
+            "?"
+            if listeners is None or listeners == lastfm_mod.TRACK_UNKNOWN
+            else str(listeners)
+        )
+        plays = t.get("playcount") or 1
+        typer.echo(
+            f"{marker:>4} listener(s), {plays:>4} plays — "
+            f"{t['artist']} — {t['title']}"
+        )
 
 
 @fetch_app.command("spotify")
@@ -280,6 +421,14 @@ def diff(
         "-x",
         help="Exclude tracks present on another (already fetched) playlist. Repeatable.",
     ),
+    exclude_lonely: int = typer.Option(
+        0,
+        "--exclude-lonely",
+        "-L",
+        min=0,
+        help="Drop tracks with at most N total last.fm listeners (also drops "
+        "tracks unknown to last.fm). 0 = off. Requires `chopin lastfm lonely`.",
+    ),
 ) -> None:
     """Show tracks scrobbled on Last.fm but missing from the playlist."""
     try:
@@ -297,11 +446,16 @@ def diff(
             except ValueError as e:
                 raise _die(str(e)) from e
 
-    lastfm_tracks, has_playcount = _load_lastfm_or_die()
+    lastfm_tracks, has_playcount, has_listeners = _load_lastfm_or_die()
     if min_plays > 1 and not has_playcount:
         raise _die(
             "last.fm cache has no playcount data (legacy format). "
             "refetch with `chopin fetch lastfm` to use --min-plays."
+        )
+    if exclude_lonely and not has_listeners:
+        raise _die(
+            "last.fm cache has no listener data. "
+            "run `chopin lastfm lonely` first to populate it."
         )
 
     _, spotify_tracks = _load_spotify_or_die(playlist_id)
@@ -325,6 +479,17 @@ def diff(
             t for t in filtered if normalize_key(t.artist, t.title) not in exclude_keys
         ]
         dropped_excl = before - len(filtered)
+    dropped_lonely = 0
+    if exclude_lonely:
+        before = len(filtered)
+        filtered = [
+            t
+            for t in filtered
+            if t.listeners is not None
+            and t.listeners != lastfm_mod.TRACK_UNKNOWN
+            and t.listeners > exclude_lonely
+        ]
+        dropped_lonely = before - len(filtered)
 
     summary = (
         f"{len(lastfm_tracks)} unique tracks on last.fm, "
@@ -335,6 +500,8 @@ def diff(
         summary += f", {dropped_min} dropped by --min-plays {min_plays}"
     if dropped_excl:
         summary += f", {dropped_excl} dropped by --exclude"
+    if dropped_lonely:
+        summary += f", {dropped_lonely} dropped by --exclude-lonely {exclude_lonely}"
     summary += f", {len(filtered)} remaining"
     typer.echo(summary, err=True)
 
@@ -356,7 +523,7 @@ def add(
         raise _die(
             "adding to Liked Songs not supported yet. pass a regular playlist."
         )
-    lastfm_tracks, _ = _load_lastfm_or_die()
+    lastfm_tracks, _, _ = _load_lastfm_or_die()
     _, spotify_tracks = _load_spotify_or_die(playlist_id)
     missing = diff_tracks(lastfm_tracks, spotify_tracks)
     if not missing:

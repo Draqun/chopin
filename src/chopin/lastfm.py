@@ -13,6 +13,7 @@ _API_URL = "https://ws.audioscrobbler.com/2.0/"
 _PAGE_LIMIT = 200
 _RETRY_DELAYS = (2, 4, 8)
 _TIMEOUT = 30
+_PER_REQUEST_DELAY = 0.2  # ~5 req/s, Last.fm's documented limit
 
 ProgressCb = Callable[[int, int], None]
 LogCb = Callable[[str], None]
@@ -111,9 +112,64 @@ def fetch_all_scrobbles(
 
     tracks = [by_key[k] for k in order]
     tracks.sort(key=lambda t: (t["artist"].lower(), t["title"].lower()))
+    return _build_payload(username, tracks)
+
+
+def _build_payload(username: str, tracks: list[dict]) -> dict:
     return {
         "user": username,
         "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "count": len(tracks),
         "tracks": tracks,
     }
+
+
+# Sentinel returned when a track is not known to last.fm at all (no info).
+TRACK_UNKNOWN: int = -1
+
+
+def get_track_listeners(api_key: str, artist: str, title: str) -> int:
+    """Return how many distinct last.fm users have scrobbled this track.
+
+    Uses track.getInfo. Returns TRACK_UNKNOWN (-1) when last.fm has no entry
+    for the (artist, title) pair (404-style errors). Sleeps briefly per call
+    to stay under the documented ~5 req/s rate.
+    """
+    params = urllib.parse.urlencode(
+        {
+            "method": "track.getInfo",
+            "artist": artist,
+            "track": title,
+            "api_key": api_key,
+            "format": "json",
+            "autocorrect": "0",
+        }
+    )
+    url = f"{_API_URL}?{params}"
+    last_err: Exception | None = None
+    for delay in (0, *_RETRY_DELAYS):
+        if delay:
+            time.sleep(delay)
+        try:
+            with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            last_err = e
+            continue
+        time.sleep(_PER_REQUEST_DELAY)
+        if "error" in payload:
+            # 6 = "Track not found" — treat as unknown, not retryable
+            if int(payload.get("error", 0)) == 6:
+                return TRACK_UNKNOWN
+            raise RuntimeError(
+                f"last.fm api error {payload.get('error')}: {payload.get('message')}"
+            )
+        track = payload.get("track") or {}
+        listeners = track.get("listeners")
+        if listeners is None:
+            return TRACK_UNKNOWN
+        try:
+            return int(listeners)
+        except (TypeError, ValueError):
+            return TRACK_UNKNOWN
+    raise RuntimeError(f"last.fm track.getInfo failed after retries: {last_err}")
