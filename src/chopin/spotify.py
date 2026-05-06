@@ -257,33 +257,51 @@ def fetch_playlist(
     }
 
 
-def search_track(
-    client: spotipy.Spotify,
-    artist: str,
-    title: str,
-    cache: dict[str, str | None],
-) -> str | None:
-    key = f"{artist.lower().strip()}||{title.lower().strip()}"
-    if key in cache:
-        return cache[key]
+def search_cache_key(artist: str, title: str) -> str:
+    return f"{artist.lower().strip()}||{title.lower().strip()}"
+
+
+def search_track_candidates(
+    client: spotipy.Spotify, artist: str, title: str, limit: int = 5
+) -> list[dict]:
+    """Return up to `limit` Spotify search hits for (artist, title).
+
+    Raises spotipy.SpotifyException on API errors (rate limit, network, 5xx)
+    so the caller can distinguish transient failures from a clean "no match".
+    Returns an empty list for "no match" (no items in response).
+    """
     q = f'track:"{title}" artist:"{artist}"'
-    try:
-        result = client.search(q=q, type="track", limit=1)
-    except spotipy.SpotifyException:
-        cache[key] = None
-        return None
+    result = client.search(q=q, type="track", limit=limit)
     items = (result.get("tracks") or {}).get("items") or []
-    track_id = items[0]["id"] if items else None
-    cache[key] = track_id
-    return track_id
+    candidates: list[dict] = []
+    for it in items:
+        artists = [a.get("name", "") for a in (it.get("artists") or []) if a.get("name")]
+        candidates.append(
+            {
+                "id": it["id"],
+                "name": it.get("name", ""),
+                "artists": artists,
+                "album": (it.get("album") or {}).get("name", ""),
+                "duration_ms": it.get("duration_ms"),
+            }
+        )
+    return candidates
 
 
 def add_tracks(
     client: spotipy.Spotify, playlist_id: str, track_ids: list[str]
 ) -> None:
+    """Add tracks to a regular playlist or to Liked Songs.
+
+    Liked Songs use a different endpoint (`current_user_saved_tracks_add`)
+    with a smaller per-call cap (50 vs 100 for playlists).
+    """
+    if playlist_id == LIKED_ID:
+        for i in range(0, len(track_ids), 50):
+            client.current_user_saved_tracks_add(track_ids[i : i + 50])
+        return
     for i in range(0, len(track_ids), 100):
-        batch = track_ids[i : i + 100]
-        client.playlist_add_items(playlist_id, batch)
+        client.playlist_add_items(playlist_id, track_ids[i : i + 100])
 
 
 READ_SCOPE = "playlist-read-private user-library-read user-read-private"

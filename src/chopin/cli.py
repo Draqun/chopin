@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Callable
 
 import questionary
@@ -208,6 +210,10 @@ def fetch_lastfm() -> None:
 
 
 _LISTENER_CHECKPOINT_EVERY = 50
+
+# sentinel for cache lookup — None means "no Spotify match" (legitimate, cached);
+# missing key means "never searched, please search".
+_CACHE_MISSING = object()
 
 
 @lastfm_app.command("lonely")
@@ -429,6 +435,13 @@ def diff(
         help="Drop tracks with at most N total last.fm listeners (also drops "
         "tracks unknown to last.fm). 0 = off. Requires `chopin lastfm lonely`.",
     ),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write the filtered missing-track list as JSON to FILE "
+        "(consume it with `chopin add --input FILE`).",
+    ),
 ) -> None:
     """Show tracks scrobbled on Last.fm but missing from the playlist."""
     try:
@@ -505,6 +518,28 @@ def diff(
     summary += f", {len(filtered)} remaining"
     typer.echo(summary, err=True)
 
+    if output:
+        payload = {
+            "playlist_id": playlist_id,
+            "filters": {
+                "min_plays": min_plays if min_plays > 1 else None,
+                "exclude": list(exclude) if exclude else None,
+                "exclude_lonely": exclude_lonely or None,
+            },
+            "count": len(filtered),
+            "tracks": [
+                {
+                    "artist": t.artist,
+                    "title": t.title,
+                    "playcount": t.playcount,
+                    "listeners": t.listeners,
+                }
+                for t in filtered
+            ],
+        }
+        storage.save_json(output, payload)
+        typer.echo(f"wrote {len(filtered)} tracks → {output}", err=True)
+
     if not filtered:
         typer.echo("nothing remaining — all missing tracks filtered out", err=True)
         return
@@ -512,63 +547,246 @@ def diff(
         typer.echo(f"{t.artist} — {t.title}")
 
 
+def _load_diff_input(path: Path) -> list[Track]:
+    """Load tracks produced by `chopin diff --output FILE`."""
+    if not path.exists():
+        raise _die(f"input file not found: {path}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise _die(f"input file is not valid JSON: {e}") from e
+    raw = data.get("tracks") if isinstance(data, dict) else data
+    if not isinstance(raw, list):
+        raise _die(
+            f"input file shape unexpected — need a list of tracks, "
+            f"or {{\"tracks\": [...]}}"
+        )
+    tracks: list[Track] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict) or "artist" not in item or "title" not in item:
+            raise _die(f"input file entry {i} missing artist/title")
+        tracks.append(
+            Track(
+                artist=item["artist"],
+                title=item["title"],
+                playcount=item.get("playcount"),
+                listeners=item.get("listeners"),
+            )
+        )
+    return tracks
+
+
+def _format_candidate(c: dict) -> str:
+    artists = ", ".join(c.get("artists") or [])
+    name = c.get("name") or ""
+    album = c.get("album") or ""
+    duration_ms = c.get("duration_ms")
+    if duration_ms:
+        secs = duration_ms // 1000
+        duration = f"{secs // 60}:{secs % 60:02d}"
+    else:
+        duration = "?:??"
+    parts = [f"{artists} — {name}"]
+    if album:
+        parts.append(f"[{album}]")
+    parts.append(f"({duration})")
+    return " ".join(parts)
+
+
+def _pick_candidate(query: Track, candidates: list[dict]) -> dict | None:
+    """Show a picker for multiple Spotify search hits. Returns chosen dict or None."""
+    typer.echo(
+        f"\nmultiple matches for: {query.artist} — {query.title}", err=True
+    )
+    choices = [
+        questionary.Choice(title=_format_candidate(c), value=i)
+        for i, c in enumerate(candidates)
+    ]
+    choices.append(questionary.Choice(title="(skip — don't add)", value=-1))
+    answer = questionary.select(
+        "pick a version", choices=choices, default=choices[0]
+    ).ask()
+    if answer is None or answer == -1:
+        return None
+    return candidates[answer]
+
+
 @app.command()
 def add(
     playlist: str = typer.Argument(..., help="Playlist URL, URI, ID, or name"),
+    input_file: Path = typer.Option(
+        ...,
+        "--input",
+        "-i",
+        help="Path to a JSON file produced by `chopin diff --output FILE`.",
+    ),
+    no_confirm: bool = typer.Option(
+        False,
+        "--no-confirm",
+        help="Skip the input-list picker and feed every track from the input "
+        "file into the search step.",
+    ),
+    auto_pick: bool = typer.Option(
+        False,
+        "--auto-pick",
+        "-A",
+        help="When the Spotify search returns multiple matches, auto-pick the "
+        "first one (legacy behavior). Default: ask interactively.",
+    ),
+    search_limit: int = typer.Option(
+        5,
+        "--search-limit",
+        min=1,
+        max=20,
+        help="How many search hits to consider per track (1 = always first).",
+    ),
+    skipped_output: Path | None = typer.Option(
+        None,
+        "--skipped",
+        "-s",
+        help="Write tracks that ended up not-added (no match, API error, or "
+        "user-skipped) as JSON to FILE for later review or rerun.",
+    ),
 ) -> None:
-    """Interactively add missing tracks to the Spotify playlist."""
+    """Add tracks listed in --input to the Spotify playlist."""
     config = _config_or_die()
     client, playlist_id = _resolve_playlist(config, playlist, spotify_mod.MODIFY_SCOPE)
-    if playlist_id == spotify_mod.LIKED_ID:
-        raise _die(
-            "adding to Liked Songs not supported yet. pass a regular playlist."
-        )
-    lastfm_tracks, _, _ = _load_lastfm_or_die()
-    _, spotify_tracks = _load_spotify_or_die(playlist_id)
-    missing = diff_tracks(lastfm_tracks, spotify_tracks)
-    if not missing:
-        typer.echo("nothing missing — playlist covers all your last.fm tracks")
+    candidates = _load_diff_input(input_file)
+    if not candidates:
+        typer.echo("input file is empty, nothing to add", err=True)
         return
-    if len(missing) > 500:
+
+    if no_confirm:
+        selected = candidates
         typer.echo(
-            f"warning: {len(missing)} missing tracks — picker may be unwieldy. "
-            "consider `chopin diff <playlist> > missing.txt` for offline review.",
+            f"feeding all {len(selected)} tracks from {input_file} "
+            "into search (--no-confirm)",
             err=True,
         )
-    choices = [
-        questionary.Choice(title=f"{t.artist} — {t.title}", value=i)
-        for i, t in enumerate(missing)
-    ]
-    answer = questionary.checkbox(
-        f"select tracks to add to playlist ({len(missing)} missing)",
-        choices=choices,
-    ).ask()
-    if not answer:
-        typer.echo("nothing selected, aborting")
-        return
-    selected = [missing[i] for i in answer]
+    else:
+        if len(candidates) > 500:
+            typer.echo(
+                f"warning: {len(candidates)} tracks in input — picker may be "
+                "unwieldy. consider editing the JSON file or rerunning "
+                "`chopin diff --output` with tighter filters.",
+                err=True,
+            )
+        choices = [
+            questionary.Choice(title=f"{t.artist} — {t.title}", value=i)
+            for i, t in enumerate(candidates)
+        ]
+        answer = questionary.checkbox(
+            f"select tracks to add to playlist ({len(candidates)} candidates)",
+            choices=choices,
+        ).ask()
+        if not answer:
+            typer.echo("nothing selected, aborting")
+            return
+        selected = [candidates[i] for i in answer]
+
     cache_path = storage.search_cache_path()
     cache: dict[str, str | None] = storage.load_json(cache_path) or {}
     resolved: list[str] = []
-    skipped: list[Track] = []
-    with Spinner("searching tracks on Spotify") as spin:
-        for i, t in enumerate(selected, 1):
-            spin.update(f"{i}/{len(selected)}: {t.artist} — {t.title}")
-            track_id = spotify_mod.search_track(client, t.artist, t.title, cache)
-            if track_id:
-                resolved.append(track_id)
+    no_match: list[Track] = []
+    errors: list[tuple[Track, str]] = []
+    user_skipped: list[Track] = []
+
+    typer.echo(
+        f"searching {len(selected)} tracks on Spotify "
+        f"(picker: {'first hit auto' if auto_pick else 'interactive'})",
+        err=True,
+    )
+    for i, t in enumerate(selected, 1):
+        prefix = f"[{i}/{len(selected)}]"
+        key = spotify_mod.search_cache_key(t.artist, t.title)
+        cached = cache.get(key, _CACHE_MISSING)
+        if cached is not _CACHE_MISSING:
+            if cached is None:
+                no_match.append(t)
+                typer.echo(f"{prefix} cached no match: {t.artist} — {t.title}", err=True)
             else:
-                skipped.append(t)
-                spin.log(f"no match: {t.artist} — {t.title}")
+                resolved.append(cached)
+                typer.echo(
+                    f"{prefix} cached: {t.artist} — {t.title}", err=True
+                )
+            continue
+
+        typer.echo(f"{prefix} searching: {t.artist} — {t.title}", err=True)
+        try:
+            hits = spotify_mod.search_track_candidates(
+                client, t.artist, t.title, limit=search_limit
+            )
+        except spotipy.SpotifyException as e:
+            errors.append((t, str(e)))
+            typer.echo(f"{prefix} api error (not cached): {e}", err=True)
+            continue
+
+        if not hits:
+            cache[key] = None
+            no_match.append(t)
+            typer.echo(f"{prefix} no match: {t.artist} — {t.title}", err=True)
+            continue
+
+        if len(hits) == 1 or auto_pick:
+            chosen = hits[0]
+        else:
+            chosen = _pick_candidate(t, hits)
+            if chosen is None:
+                user_skipped.append(t)
+                typer.echo(f"{prefix} skipped by user", err=True)
+                continue
+
+        cache[key] = chosen["id"]
+        resolved.append(chosen["id"])
+        typer.echo(
+            f"{prefix} → {_format_candidate(chosen)}", err=True
+        )
+
     storage.save_json(cache_path, cache)
     if resolved:
         with Spinner(f"adding {len(resolved)} tracks to playlist"):
             spotify_mod.add_tracks(client, playlist_id, resolved)
+
     typer.echo(f"added {len(resolved)} tracks")
-    if skipped:
-        typer.echo(f"skipped {len(skipped)} (no Spotify match):")
-        for t in skipped:
+    if no_match:
+        typer.echo(f"skipped {len(no_match)} (no Spotify match):")
+        for t in no_match:
             typer.echo(f"  - {t.artist} — {t.title}")
+    if errors:
+        typer.echo(f"errored on {len(errors)} (transient API errors, not cached):")
+        for t, err in errors:
+            typer.echo(f"  - {t.artist} — {t.title}: {err}")
+    if user_skipped:
+        typer.echo(f"user-skipped {len(user_skipped)}:")
+        for t in user_skipped:
+            typer.echo(f"  - {t.artist} — {t.title}")
+
+    if skipped_output is not None:
+        not_added = no_match + [t for t, _ in errors] + user_skipped
+        payload = {
+            "playlist_id": playlist_id,
+            "input_file": str(input_file),
+            "count": len(not_added),
+            "categories": {
+                "no_match": len(no_match),
+                "errors": len(errors),
+                "user_skipped": len(user_skipped),
+            },
+            "tracks": [
+                {
+                    "artist": t.artist,
+                    "title": t.title,
+                    "playcount": t.playcount,
+                    "listeners": t.listeners,
+                }
+                for t in not_added
+            ],
+        }
+        storage.save_json(skipped_output, payload)
+        typer.echo(
+            f"wrote {len(not_added)} skipped tracks → {skipped_output}",
+            err=True,
+        )
 
 
 def main() -> None:  # pragma: no cover

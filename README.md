@@ -144,7 +144,8 @@ Liked Songs are stored under the sentinel id `liked`
 ### 3. Show what's missing
 
 ```sh
-chopin diff [<playlist>] [--min-plays N] [--exclude PLAYLIST]...
+chopin diff [<playlist>] [--min-plays N] [--exclude PLAYLIST]... \
+            [--exclude-lonely N] [--output FILE]
 ```
 
 Reads both caches, prints a one-line summary and the full list of missing
@@ -169,9 +170,15 @@ Three filters refine the missing list:
   listeners (and tracks Last.fm has never heard of). Requires the listener
   data to be populated first via `chopin lastfm lonely` (see below).
 
+`--output FILE` (`-o`) additionally writes the filtered result as JSON to
+FILE. That file is the input for `chopin add` (see the next section), so
+the two commands form a small pipeline you can inspect and edit between
+steps.
+
 ```sh
 chopin fetch spotify Smutne
-chopin diff -m 3 -x Smutne -x "Discover Weekly" -L 1
+chopin diff -m 3 -x Smutne -x "Discover Weekly" -L 1 \
+            --output picks.json
 ```
 
 Read-only — does not modify anything on Spotify.
@@ -197,22 +204,57 @@ across refetches.
 Tracks not known to Last.fm at all are tagged `?` in the output —
 those are the most likely junk.
 
-### 5. Interactively add missing tracks
+### 5. Add tracks from a diff to a playlist
 
 ```sh
-chopin add <playlist>
+chopin add <playlist> --input picks.json \
+          [--no-confirm] [--auto-pick] \
+          [--search-limit N] [--skipped FILE]
 ```
 
-Opens an interactive checklist of the missing tracks. Toggle with space,
-confirm with enter. For each selected track, `chopin` issues a Spotify search
-(`track:<title> artist:<artist>`), takes the first hit, and adds it to the
-playlist. Search results are cached at
-`~/.local/share/chopin/search_cache.json` so re-runs don't re-query the API.
+`add` consumes the JSON file produced by `chopin diff --output`. This is
+deliberate — it keeps `add` and `diff` in sync (no duplicated filter
+flags) and lets you inspect or hand-edit the file between the two steps:
 
-Tracks that don't return any Spotify hit are reported at the end and skipped.
-`<playlist>` accepts the same forms as `fetch spotify` **except** Liked
-Songs — Spotify exposes a different API for saved-track modification, which
-isn't wired up yet.
+```sh
+chopin diff Liked -m 3 -L 1 --output picks.json
+$EDITOR picks.json                       # optional: trim noise by hand
+chopin add Liked --input picks.json
+```
+
+The flow has two interactive stages:
+
+1. **Input picker** — a checklist of all tracks from the input file. Toggle
+   with space, confirm with enter. `--no-confirm` skips this stage and
+   feeds the entire input file into the search step.
+2. **Per-track disambiguation** — for each selected track, `chopin`
+   queries Spotify (`track:<title> artist:<artist>`) and asks how many
+   hits to consider via `--search-limit N` (default 5). When the search
+   returns more than one match, you pick which version to add. The
+   picker shows `artists — title [album] (m:ss)` per candidate, plus a
+   "skip" choice. `--auto-pick` (`-A`) restores the legacy first-hit-wins
+   behavior.
+
+Search results are cached at `~/.local/share/chopin/search_cache.json`
+so subsequent runs don't re-query for the same `(artist, title)` pair.
+Only definitive outcomes are cached — transient API errors (rate-limit,
+network glitches, 5xx) are reported and retried on the next run rather
+than poisoning the cache as "no match".
+
+After the search step, `add` reports three categories of non-additions:
+
+- **no Spotify match** — Spotify returned zero hits.
+- **API errors** — transient failures; rerun and they'll be retried.
+- **user-skipped** — you chose "skip" in the disambiguation picker.
+
+`--skipped FILE` writes all of those to a JSON file in the same shape
+that `--input` consumes, so you can review them later, hand-fix titles,
+and rerun `chopin add` against that file.
+
+`<playlist>` accepts the same forms as `fetch spotify`, including the
+Liked Songs aliases (`liked`, `polubione`, …) — saved tracks use a
+separate API endpoint (`current_user_saved_tracks_add`, capped at 50 per
+call), which `add_tracks` switches to automatically.
 
 ## Data storage
 
@@ -240,9 +282,6 @@ To start clean, delete the file in question and re-run the relevant `fetch`.
   you care about edition accuracy.
 - **No incremental Last.fm sync.** `fetch lastfm` always pulls everything from
   scratch. Fine for tens of thousands of scrobbles, slow above that.
-- **`add` does not target Liked Songs.** Saved tracks use a separate
-  Spotify endpoint (`current_user_saved_tracks_add`) that hasn't been wired
-  in yet. `fetch spotify` and `diff` both work against Liked Songs.
 - **Single user.** Configuration is global per machine — no profile
   switching.
 

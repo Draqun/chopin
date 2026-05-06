@@ -91,10 +91,12 @@ fetch-spotify: ## Pull a Spotify playlist (usage: make fetch-spotify [PLAYLIST=<
 		$(CHOPIN) fetch spotify "$(PLAYLIST)"; \
 	fi
 
-diff: ## Show tracks missing from a playlist (vars: PLAYLIST, MIN_PLAYS, EXCLUDE — for multiple excludes call chopin directly)
+diff: ## Show tracks missing from a playlist (vars: PLAYLIST, MIN_PLAYS, EXCLUDE, EXCLUDE_LONELY, OUTPUT — for multiple excludes call chopin directly)
 	@args=""; \
 	if [ -n "$(MIN_PLAYS)" ]; then args="$$args --min-plays $(MIN_PLAYS)"; fi; \
 	if [ -n "$(EXCLUDE)" ]; then args="$$args --exclude \"$(EXCLUDE)\""; fi; \
+	if [ -n "$(EXCLUDE_LONELY)" ]; then args="$$args --exclude-lonely $(EXCLUDE_LONELY)"; fi; \
+	if [ -n "$(OUTPUT)" ]; then args="$$args --output \"$(OUTPUT)\""; fi; \
 	if [ -z "$(PLAYLIST)" ]; then \
 		eval "$(CHOPIN) diff $$args"; \
 	else \
@@ -108,12 +110,17 @@ lonely: ## List last.fm tracks where you are essentially the only listener (vars
 		$(CHOPIN) lastfm lonely --max-listeners $(MAX_LISTENERS); \
 	fi
 
-add: ## Interactively add missing tracks (usage: make add PLAYLIST=<url|uri|id>)
-	@if [ -z "$(PLAYLIST)" ]; then \
-		echo "error: PLAYLIST not set. usage: make add PLAYLIST=<url|uri|id>"; \
+add: ## Add tracks from a diff JSON to a playlist (vars: PLAYLIST, INPUT, NO_CONFIRM=1, AUTO_PICK=1, SKIPPED=<json>)
+	@if [ -z "$(PLAYLIST)" ] || [ -z "$(INPUT)" ]; then \
+		echo "error: PLAYLIST and INPUT are required."; \
+		echo "usage: make add PLAYLIST=<...> INPUT=<diff.json> [NO_CONFIRM=1] [AUTO_PICK=1] [SKIPPED=<json>]"; \
 		exit 1; \
 	fi
-	$(CHOPIN) add "$(PLAYLIST)"
+	@args=""; \
+	if [ -n "$(NO_CONFIRM)" ]; then args="$$args --no-confirm"; fi; \
+	if [ -n "$(AUTO_PICK)" ]; then args="$$args --auto-pick"; fi; \
+	if [ -n "$(SKIPPED)" ]; then args="$$args --skipped \"$(SKIPPED)\""; fi; \
+	eval "$(CHOPIN) add \"$(PLAYLIST)\" --input \"$(INPUT)\" $$args"
 
 data-dir: ## Print the local cache directory path
 	@$(PYTHON) -c "from chopin.storage import data_dir; print(data_dir())"
