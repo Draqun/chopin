@@ -26,7 +26,9 @@ refresh by re-running `fetch`.
 - Python 3.11+
 - A Last.fm API account (free): https://www.last.fm/api/account/create
 - A Spotify developer app: https://developer.spotify.com/dashboard
-  - Add `http://localhost:8888/callback` to the app's Redirect URIs.
+  - Add `http://127.0.0.1:8888/callback` to the app's Redirect URIs.
+    (Spotify is deprecating `localhost` as a redirect host — use the
+    loopback IP instead.)
 
 ## Install
 
@@ -50,7 +52,7 @@ LASTFM_USER=your_lastfm_username
 # Spotify
 SPOTIPY_CLIENT_ID=your_spotify_client_id
 SPOTIPY_CLIENT_SECRET=your_spotify_client_secret
-SPOTIPY_REDIRECT_URI=http://localhost:8888/callback
+SPOTIPY_REDIRECT_URI=http://127.0.0.1:8888/callback
 ```
 
 The first time you run a Spotify command, a browser window opens for OAuth
@@ -59,44 +61,71 @@ so subsequent runs don't prompt again.
 
 ## Usage
 
+All long-running commands print live progress to stderr — a spinner with a
+status line on a TTY, plain log lines when piped or redirected.
+
 ### 1. Pull your Last.fm history
 
 ```sh
 chopin fetch lastfm
 ```
 
-Walks `user.getRecentTracks` page by page until exhausted. Writes everything
-to `~/.local/share/chopin/lastfm.json`. Re-running overwrites the cache.
+Walks `user.getRecentTracks` page by page until exhausted, counting how many
+times you've scrobbled each track along the way. Writes everything to
+`~/.local/share/chopin/lastfm.json`. Re-running overwrites the cache.
 
 ### 2. Pull a Spotify playlist
 
 ```sh
-chopin fetch spotify <playlist>
+chopin fetch spotify [<playlist>]
 ```
 
-`<playlist>` accepts any of:
+With no argument, fetches your **Liked Songs** (the default). `<playlist>`
+accepts any of:
 
 - a full URL: `https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M`
 - a Spotify URI: `spotify:playlist:37i9dQZF1DXcBWIGoYBM5M`
 - a bare playlist ID: `37i9dQZF1DXcBWIGoYBM5M`
+- a playlist **name** owned by you: `"Discover Weekly"` — looked up against
+  your playlists; an exact case-insensitive match wins
+- an alias for Liked Songs: `liked`, `saved`, `polubione`, `ulubione`,
+  `liked songs`
 
-Writes to `~/.local/share/chopin/spotify_<playlist_id>.json`.
+Liked Songs are stored under the sentinel id `liked`
+(`~/.local/share/chopin/spotify_liked.json`); regular playlists go to
+`~/.local/share/chopin/spotify_<playlist_id>.json`.
 
 ### 3. Show what's missing
 
 ```sh
-chopin diff <playlist>
+chopin diff [<playlist>] [--min-plays N] [--exclude PLAYLIST]...
 ```
 
 Reads both caches, prints a one-line summary and the full list of missing
-tracks in `artist - title` format, one per line. Pipe-friendly:
+tracks in `artist - title` format, one per line. Defaults to comparing
+against Liked Songs. Pipe-friendly:
 
 ```sh
-chopin diff <playlist> | grep -i "radiohead"
-chopin diff <playlist> | wc -l
+chopin diff | grep -i "radiohead"
+chopin diff "Discover Weekly" | wc -l
 ```
 
-Read-only — does not modify anything.
+Two filters refine the missing list:
+
+- `--min-plays N` (`-m`) drops tracks scrobbled fewer than N times. Useful
+  for skipping one-off plays of songs you didn't actually like. Requires a
+  cache produced after the playcount feature landed; older caches are
+  rejected with a refetch hint.
+- `--exclude PLAYLIST` (`-x`) subtracts tracks present on another already
+  fetched playlist. Repeatable. Each value accepts URL, URI, bare id, or
+  playlist name. The referenced playlists must already be cached locally.
+
+```sh
+chopin fetch spotify Smutne
+chopin diff -m 3 -x Smutne -x "Discover Weekly"
+```
+
+Read-only — does not modify anything on Spotify.
 
 ### 4. Interactively add missing tracks
 
@@ -111,6 +140,9 @@ playlist. Search results are cached at
 `~/.local/share/chopin/search_cache.json` so re-runs don't re-query the API.
 
 Tracks that don't return any Spotify hit are reported at the end and skipped.
+`<playlist>` accepts the same forms as `fetch spotify` **except** Liked
+Songs — Spotify exposes a different API for saved-track modification, which
+isn't wired up yet.
 
 ## Data storage
 
@@ -138,6 +170,9 @@ To start clean, delete the file in question and re-run the relevant `fetch`.
   you care about edition accuracy.
 - **No incremental Last.fm sync.** `fetch lastfm` always pulls everything from
   scratch. Fine for tens of thousands of scrobbles, slow above that.
+- **`add` does not target Liked Songs.** Saved tracks use a separate
+  Spotify endpoint (`current_user_saved_tracks_add`) that hasn't been wired
+  in yet. `fetch spotify` and `diff` both work against Liked Songs.
 - **Single user.** Configuration is global per machine — no profile
   switching.
 
