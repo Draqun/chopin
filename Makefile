@@ -57,19 +57,19 @@ test-verbose: ## Run tests with verbose output
 fetch-lastfm: ## Pull full scrobble history from Last.fm
 	$(CHOPIN) fetch lastfm
 
-fetch-spotify: ## Pull a Spotify playlist (usage: make fetch-spotify PLAYLIST=<url|uri|id>)
+fetch-spotify: ## Pull a Spotify playlist (usage: make fetch-spotify [PLAYLIST=<url|uri|id|name>], default = Liked Songs)
 	@if [ -z "$(PLAYLIST)" ]; then \
-		echo "error: PLAYLIST not set. usage: make fetch-spotify PLAYLIST=<url|uri|id>"; \
-		exit 1; \
+		$(CHOPIN) fetch spotify; \
+	else \
+		$(CHOPIN) fetch spotify "$(PLAYLIST)"; \
 	fi
-	$(CHOPIN) fetch spotify "$(PLAYLIST)"
 
-diff: ## Show tracks missing from a playlist (usage: make diff PLAYLIST=<url|uri|id>)
+diff: ## Show tracks missing from a playlist (usage: make diff [PLAYLIST=<url|uri|id|name>], default = Liked Songs)
 	@if [ -z "$(PLAYLIST)" ]; then \
-		echo "error: PLAYLIST not set. usage: make diff PLAYLIST=<url|uri|id>"; \
-		exit 1; \
+		$(CHOPIN) diff; \
+	else \
+		$(CHOPIN) diff "$(PLAYLIST)"; \
 	fi
-	$(CHOPIN) diff "$(PLAYLIST)"
 
 add: ## Interactively add missing tracks (usage: make add PLAYLIST=<url|uri|id>)
 	@if [ -z "$(PLAYLIST)" ]; then \

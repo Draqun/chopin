@@ -11,6 +11,7 @@ class Track:
     artist: str
     title: str
     album: str | None = None
+    playcount: int | None = None
 
 
 _PARENS = re.compile(r"\s*[\(\[].*?[\)\]]\s*")

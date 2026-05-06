@@ -1,47 +1,115 @@
-"""Fetch full scrobble history from Last.fm via pylast."""
+"""Fetch full scrobble history from Last.fm via the public REST API."""
 
 from __future__ import annotations
 
+import json
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
-from typing import Any
+from typing import Callable
 
-import pylast
-
-
+_API_URL = "https://ws.audioscrobbler.com/2.0/"
+_PAGE_LIMIT = 200
 _RETRY_DELAYS = (2, 4, 8)
+_TIMEOUT = 30
+
+ProgressCb = Callable[[int, int], None]
+LogCb = Callable[[str], None]
 
 
-def _fetch_with_retry(api_key: str, username: str) -> list[Any]:
-    network = pylast.LastFMNetwork(api_key=api_key)
-    user = network.get_user(username)
+def _request_page(api_key: str, username: str, page: int) -> dict:
+    params = urllib.parse.urlencode(
+        {
+            "method": "user.getrecenttracks",
+            "user": username,
+            "api_key": api_key,
+            "format": "json",
+            "limit": _PAGE_LIMIT,
+            "page": page,
+        }
+    )
+    url = f"{_API_URL}?{params}"
     last_err: Exception | None = None
     for delay in (0, *_RETRY_DELAYS):
         if delay:
             time.sleep(delay)
         try:
-            return list(user.get_recent_tracks(limit=None))
-        except (pylast.NetworkError, pylast.WSError, pylast.MalformedResponseError) as e:
+            with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
             last_err = e
+            continue
+        if "error" in payload:
+            raise RuntimeError(
+                f"last.fm api error {payload.get('error')}: {payload.get('message')}"
+            )
+        return payload
     raise RuntimeError(f"last.fm fetch failed after retries: {last_err}")
 
 
-def fetch_all_scrobbles(api_key: str, username: str) -> dict:
-    played = _fetch_with_retry(api_key, username)
-    seen: set[tuple[str, str]] = set()
-    tracks: list[dict] = []
-    for entry in played:
-        track = entry.track
-        artist = str(track.artist).strip()
-        title = str(track.title).strip()
-        if not artist or not title:
-            continue
-        key = (artist.lower(), title.lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        album = entry.album.strip() if getattr(entry, "album", None) else None
-        tracks.append({"artist": artist, "title": title, "album": album or None})
+def _normalize_items(raw) -> list[dict]:
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        return [raw]
+    return list(raw)
+
+
+def fetch_all_scrobbles(
+    api_key: str,
+    username: str,
+    progress: ProgressCb | None = None,
+    log: LogCb | None = None,
+) -> dict:
+    if log:
+        log("requesting page 1 (discovering total)")
+    first = _request_page(api_key, username, 1)
+    rt = first.get("recenttracks", {})
+    attr = rt.get("@attr", {})
+    total_pages = max(int(attr.get("totalPages", 1)), 1)
+    total_scrobbles = int(attr.get("total", 0) or 0)
+    if log:
+        log(f"total: {total_scrobbles} scrobbles across {total_pages} pages")
+
+    by_key: dict[tuple[str, str], dict] = {}
+    order: list[tuple[str, str]] = []
+
+    def consume(page_data: dict) -> None:
+        items = _normalize_items(page_data.get("recenttracks", {}).get("track"))
+        for item in items:
+            if (item.get("@attr") or {}).get("nowplaying") == "true":
+                continue
+            artist = ((item.get("artist") or {}).get("#text") or "").strip()
+            title = (item.get("name") or "").strip()
+            if not artist or not title:
+                continue
+            key = (artist.lower(), title.lower())
+            existing = by_key.get(key)
+            if existing is None:
+                album = ((item.get("album") or {}).get("#text") or "").strip()
+                by_key[key] = {
+                    "artist": artist,
+                    "title": title,
+                    "album": album or None,
+                    "playcount": 1,
+                }
+                order.append(key)
+            else:
+                existing["playcount"] += 1
+
+    consume(first)
+    if progress:
+        progress(1, total_pages)
+    for page in range(2, total_pages + 1):
+        if log:
+            log(f"requesting page {page}/{total_pages}")
+        data = _request_page(api_key, username, page)
+        consume(data)
+        if progress:
+            progress(page, total_pages)
+
+    tracks = [by_key[k] for k in order]
     tracks.sort(key=lambda t: (t["artist"].lower(), t["title"].lower()))
     return {
         "user": username,
