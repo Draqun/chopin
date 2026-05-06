@@ -101,15 +101,54 @@ def resolve_playlist(client: spotipy.Spotify, value: str) -> str:
         return find_playlist_by_name(client, value)
 
 
-def _extract_track(track: dict | None) -> dict | None:
-    if not track or not track.get("id"):
+def _extract_track(
+    item_obj: dict | None, skip: dict[str, int]
+) -> dict | None:
+    """Extract track from a playlist/saved-track item wrapper.
+
+    Handles both the legacy `item.track` shape (saved tracks, older playlists)
+    and the newer `item.item` shape (some playlists return the entry under
+    'item' instead of 'track').
+    """
+    if not item_obj:
+        skip["null_track"] += 1
+        return None
+    track = item_obj.get("track") or item_obj.get("item")
+    if not track:
+        skip["null_track"] += 1
+        return None
+    if track.get("is_local") or item_obj.get("is_local"):
+        skip["is_local"] += 1
+        return None
+    if not track.get("id"):
+        skip["no_id"] += 1
         return None
     artists = track.get("artists") or []
     artist = ", ".join(a.get("name", "") for a in artists if a.get("name"))
     title = track.get("name") or ""
     if not artist or not title:
+        skip["no_artist_title"] += 1
         return None
     return {"id": track["id"], "artist": artist, "title": title}
+
+
+def _new_skip_counter() -> dict[str, int]:
+    return {"null_track": 0, "is_local": 0, "no_id": 0, "no_artist_title": 0}
+
+
+def _log_skips(log: LogCb | None, skip: dict[str, int]) -> None:
+    total = sum(skip.values())
+    if log and total:
+        parts = [f"{k}={v}" for k, v in skip.items() if v]
+        log(f"skipped {total} items ({', '.join(parts)})")
+
+
+def _user_market(client: spotipy.Spotify) -> str | None:
+    try:
+        me = client.current_user()
+    except Exception:
+        return None
+    return me.get("country") or None
 
 
 def _fetch_liked(
@@ -117,19 +156,22 @@ def _fetch_liked(
     progress: ProgressCb | None = None,
     log: LogCb | None = None,
 ) -> dict:
+    market = _user_market(client)
     if log:
+        log(f"using market={market or 'unspecified'}")
         log("requesting first batch of saved tracks (50)")
-    results = client.current_user_saved_tracks(limit=50)
+    results = client.current_user_saved_tracks(limit=50, market=market)
     total = int(results.get("total") or 0)
     if log:
         log(f"total saved tracks: {total}")
     seen: set[str] = set()
     tracks: list[dict] = []
+    skip = _new_skip_counter()
     fetched = 0
     while results:
         items = results.get("items", []) or []
         for item in items:
-            t = _extract_track(item.get("track") if item else None)
+            t = _extract_track(item, skip)
             if not t or t["id"] in seen:
                 continue
             seen.add(t["id"])
@@ -143,6 +185,7 @@ def _fetch_liked(
             results = client.next(results)
         else:
             break
+    _log_skips(log, skip)
     return {
         "playlist_id": LIKED_ID,
         "playlist_name": "Liked Songs",
@@ -160,24 +203,37 @@ def fetch_playlist(
 ) -> dict:
     if playlist_id == LIKED_ID:
         return _fetch_liked(client, progress, log)
+    market = _user_market(client)
     if log:
+        log(f"using market={market or 'unspecified'}")
         log(f"requesting playlist metadata for {playlist_id}")
-    meta = client.playlist(playlist_id, fields="id,name,tracks(total)")
-    total = int(((meta.get("tracks") or {}).get("total")) or 0)
-    if log:
-        log(f"playlist {meta.get('name', '?')!r}: {total} tracks")
+    meta = client.playlist(playlist_id, fields="id,name", market=market)
+    name = meta.get("name") or ""
     seen: set[str] = set()
     tracks: list[dict] = []
+    skip = _new_skip_counter()
     fetched = 0
+    # Spotify returns playlist entries under either `track` (legacy) or `item`
+    # (newer); request both so the fields filter doesn't strip the right one.
+    item_fields = (
+        "track(id,name,artists(name),is_local),"
+        "item(id,name,artists(name),is_local),"
+        "is_local"
+    )
+    fields = f"items({item_fields}),next,total"
     results = client.playlist_items(
         playlist_id,
-        fields="items(track(id,name,artists(name))),next",
+        fields=fields,
         additional_types=("track",),
+        market=market,
     )
+    total = int(results.get("total") or 0)
+    if log:
+        log(f"playlist {name!r}: {total} tracks")
     while results:
         items = results.get("items", []) or []
         for item in items:
-            t = _extract_track(item.get("track") if item else None)
+            t = _extract_track(item, skip)
             if not t or t["id"] in seen:
                 continue
             seen.add(t["id"])
@@ -191,9 +247,10 @@ def fetch_playlist(
             results = client.next(results)
         else:
             break
+    _log_skips(log, skip)
     return {
         "playlist_id": meta["id"],
-        "playlist_name": meta.get("name", ""),
+        "playlist_name": name,
         "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "count": len(tracks),
         "tracks": tracks,
@@ -229,8 +286,8 @@ def add_tracks(
         client.playlist_add_items(playlist_id, batch)
 
 
-READ_SCOPE = "playlist-read-private user-library-read"
+READ_SCOPE = "playlist-read-private user-library-read user-read-private"
 MODIFY_SCOPE = (
     "playlist-modify-public playlist-modify-private playlist-read-private "
-    "user-library-read user-library-modify"
+    "user-library-read user-library-modify user-read-private"
 )
