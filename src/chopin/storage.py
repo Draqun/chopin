@@ -31,6 +31,10 @@ def search_cache_path() -> Path:
     return data_dir() / "search_cache.json"
 
 
+def pushed_log_path(playlist_id: str) -> Path:
+    return data_dir() / f"pushed_{playlist_id}.json"
+
+
 def spotify_oauth_cache_path() -> Path:
     return data_dir() / ".spotify_cache"
 

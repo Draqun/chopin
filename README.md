@@ -241,6 +241,19 @@ Only definitive outcomes are cached — transient API errors (rate-limit,
 network glitches, 5xx) are reported and retried on the next run rather
 than poisoning the cache as "no match".
 
+Tracks are pushed to Spotify **incrementally** in batches of 25 during
+the search loop, not at the end. That means partial progress survives
+Ctrl+C, rate limits, or any other crash — rerun `chopin add` against
+the same input file and the search cache will resolve already-pushed
+tracks instantly while picking up where the previous run left off.
+
+Per-playlist, `chopin` records the IDs it has already pushed in
+`~/.local/share/chopin/pushed_<playlist_id>.json` (or
+`pushed_liked.json`). On resume, anything already in that log is skipped
+before the API call — no duplicates on regular playlists where
+`playlist_add_items` is not idempotent. Liked Songs are idempotent on
+Spotify's side, so the log there is just a courtesy.
+
 After the search step, `add` reports three categories of non-additions:
 
 - **no Spotify match** — Spotify returned zero hits.

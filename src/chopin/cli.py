@@ -210,6 +210,10 @@ def fetch_lastfm() -> None:
 
 
 _LISTENER_CHECKPOINT_EVERY = 50
+# Push tracks to Spotify in chunks during the search loop so partial work
+# survives rate limits, network blips, and Ctrl+C. Smaller than the API per-call
+# cap (50 for Liked, 100 for playlists) so failures don't lose a full batch.
+_ADD_FLUSH_EVERY = 25
 
 # sentinel for cache lookup — None means "no Spotify match" (legitimate, cached);
 # missing key means "never searched, please search".
@@ -686,68 +690,146 @@ def add(
 
     cache_path = storage.search_cache_path()
     cache: dict[str, str | None] = storage.load_json(cache_path) or {}
-    resolved: list[str] = []
+    pushed_path = storage.pushed_log_path(playlist_id)
+    already_pushed: set[str] = set(storage.load_json(pushed_path) or [])
+    if already_pushed:
+        typer.echo(
+            f"resuming: {len(already_pushed)} tracks already pushed to this "
+            "playlist by a prior run, will be skipped",
+            err=True,
+        )
+    pending: list[str] = []
+    added_total = 0
     no_match: list[Track] = []
     errors: list[tuple[Track, str]] = []
     user_skipped: list[Track] = []
 
+    def flush_pending(reason: str) -> None:
+        nonlocal added_total
+        if not pending:
+            return
+        new_ids = [tid for tid in pending if tid not in already_pushed]
+        pending_count = len(pending)
+        if not new_ids:
+            typer.echo(
+                f"already pushed: {pending_count} tracks "
+                f"(skipping — {reason})",
+                err=True,
+            )
+            pending.clear()
+            return
+        try:
+            spotify_mod.add_tracks(client, playlist_id, new_ids)
+        except spotipy.SpotifyException as e:
+            typer.echo(
+                f"flush failed ({len(new_ids)} new tracks held back, "
+                f"will retry on next run): {e}",
+                err=True,
+            )
+            return
+        already_pushed.update(new_ids)
+        storage.save_json(pushed_path, sorted(already_pushed))
+        added_total += len(new_ids)
+        dup_skipped = pending_count - len(new_ids)
+        msg = (
+            f"pushed {len(new_ids)} tracks to playlist "
+            f"({added_total} total — {reason})"
+        )
+        if dup_skipped:
+            msg += f"; {dup_skipped} already pushed earlier, skipped"
+        typer.echo(msg, err=True)
+        pending.clear()
+        storage.save_json(cache_path, cache)
+
     typer.echo(
         f"searching {len(selected)} tracks on Spotify "
-        f"(picker: {'first hit auto' if auto_pick else 'interactive'})",
+        f"(picker: {'first hit auto' if auto_pick else 'interactive'}, "
+        f"flush every {_ADD_FLUSH_EVERY})",
         err=True,
     )
-    for i, t in enumerate(selected, 1):
-        prefix = f"[{i}/{len(selected)}]"
-        key = spotify_mod.search_cache_key(t.artist, t.title)
-        cached = cache.get(key, _CACHE_MISSING)
-        if cached is not _CACHE_MISSING:
-            if cached is None:
-                no_match.append(t)
-                typer.echo(f"{prefix} cached no match: {t.artist} — {t.title}", err=True)
+    try:
+        for i, t in enumerate(selected, 1):
+            prefix = f"[{i}/{len(selected)}]"
+            key = spotify_mod.search_cache_key(t.artist, t.title)
+            cached = cache.get(key, _CACHE_MISSING)
+            if cached is not _CACHE_MISSING:
+                if cached is None:
+                    no_match.append(t)
+                    typer.echo(
+                        f"{prefix} cached no match: {t.artist} — {t.title}",
+                        err=True,
+                    )
+                else:
+                    pending.append(cached)
+                    typer.echo(
+                        f"{prefix} cached: {t.artist} — {t.title}", err=True
+                    )
             else:
-                resolved.append(cached)
                 typer.echo(
-                    f"{prefix} cached: {t.artist} — {t.title}", err=True
+                    f"{prefix} searching: {t.artist} — {t.title}", err=True
                 )
-            continue
+                try:
+                    hits = spotify_mod.search_track_candidates(
+                        client, t.artist, t.title, limit=search_limit
+                    )
+                except spotipy.SpotifyException as e:
+                    if getattr(e, "http_status", None) == 429:
+                        retry_after = (e.headers or {}).get("Retry-After")
+                        typer.echo(
+                            f"{prefix} HARD RATE LIMIT (429). retry-after="
+                            f"{retry_after}s. aborting run — flushing what "
+                            "we have. wait it out, switch to another Spotify "
+                            "client_id, or rerun later (search cache and "
+                            "pushed log preserve progress).",
+                            err=True,
+                        )
+                        flush_pending("rate-limit abort")
+                        return
+                    errors.append((t, str(e)))
+                    typer.echo(
+                        f"{prefix} api error (not cached): {e}", err=True
+                    )
+                    continue
 
-        typer.echo(f"{prefix} searching: {t.artist} — {t.title}", err=True)
-        try:
-            hits = spotify_mod.search_track_candidates(
-                client, t.artist, t.title, limit=search_limit
-            )
-        except spotipy.SpotifyException as e:
-            errors.append((t, str(e)))
-            typer.echo(f"{prefix} api error (not cached): {e}", err=True)
-            continue
+                if not hits:
+                    cache[key] = None
+                    no_match.append(t)
+                    typer.echo(
+                        f"{prefix} no match: {t.artist} — {t.title}", err=True
+                    )
+                    continue
 
-        if not hits:
-            cache[key] = None
-            no_match.append(t)
-            typer.echo(f"{prefix} no match: {t.artist} — {t.title}", err=True)
-            continue
+                if len(hits) == 1 or auto_pick:
+                    chosen = hits[0]
+                else:
+                    chosen = _pick_candidate(t, hits)
+                    if chosen is None:
+                        user_skipped.append(t)
+                        typer.echo(f"{prefix} skipped by user", err=True)
+                        continue
 
-        if len(hits) == 1 or auto_pick:
-            chosen = hits[0]
-        else:
-            chosen = _pick_candidate(t, hits)
-            if chosen is None:
-                user_skipped.append(t)
-                typer.echo(f"{prefix} skipped by user", err=True)
-                continue
+                cache[key] = chosen["id"]
+                pending.append(chosen["id"])
+                typer.echo(
+                    f"{prefix} → {_format_candidate(chosen)}", err=True
+                )
 
-        cache[key] = chosen["id"]
-        resolved.append(chosen["id"])
+            if len(pending) >= _ADD_FLUSH_EVERY:
+                flush_pending(f"batch at {i}/{len(selected)}")
+    except KeyboardInterrupt:
         typer.echo(
-            f"{prefix} → {_format_candidate(chosen)}", err=True
+            "\ninterrupted — flushing what we have before exiting ...",
+            err=True,
         )
+        flush_pending("interrupted")
+        storage.save_json(cache_path, cache)
+        raise
+    finally:
+        storage.save_json(cache_path, cache)
 
-    storage.save_json(cache_path, cache)
-    if resolved:
-        with Spinner(f"adding {len(resolved)} tracks to playlist"):
-            spotify_mod.add_tracks(client, playlist_id, resolved)
+    flush_pending("end")
 
-    typer.echo(f"added {len(resolved)} tracks")
+    typer.echo(f"added {added_total} tracks")
     if no_match:
         typer.echo(f"skipped {len(no_match)} (no Spotify match):")
         for t in no_match:

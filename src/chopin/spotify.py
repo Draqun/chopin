@@ -48,7 +48,15 @@ def make_client(config: Config, scope: str) -> spotipy.Spotify:
         cache_path=str(spotify_oauth_cache_path()),
         open_browser=True,
     )
-    return spotipy.Spotify(auth_manager=auth)
+    # Disable HTTP-status retries so a 429 with a multi-hour Retry-After
+    # raises immediately instead of putting the process to sleep. We
+    # handle 429 explicitly at the call site.
+    return spotipy.Spotify(
+        auth_manager=auth,
+        retries=2,
+        status_retries=0,
+        backoff_factor=0.3,
+    )
 
 
 def ensure_auth(client: spotipy.Spotify) -> None:
