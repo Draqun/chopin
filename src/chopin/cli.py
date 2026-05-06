@@ -15,7 +15,7 @@ from chopin import lastfm as lastfm_mod
 from chopin import spotify as spotify_mod
 from chopin import storage
 from chopin.config import Config, ConfigError, load_config
-from chopin.matching import Track, diff_tracks
+from chopin.matching import Track, diff_tracks, normalize_key
 
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -210,11 +210,75 @@ def fetch_spotify(
     )
 
 
+def _resolve_many_playlists(
+    values: list[str], scope: str
+) -> list[str]:
+    """Resolve a list of playlist references to ids. Auths once if any need name lookup."""
+    needs_lookup: list[str] = []
+    cheap: list[str] = []
+    for v in values:
+        try:
+            cheap.append(spotify_mod.parse_playlist_id(v))
+        except ValueError:
+            needs_lookup.append(v)
+    if not needs_lookup:
+        return cheap
+    config = _config_or_die()
+    client = spotify_mod.make_client(config, scope)
+    typer.echo("authorizing Spotify ...", err=True)
+    spotify_mod.ensure_auth(client)
+    resolved: list[str] = list(cheap)
+    for v in needs_lookup:
+        with Spinner(f"resolving playlist name {v!r}") as spin:
+            try:
+                resolved.append(
+                    spotify_mod.find_playlist_by_name(client, v, log=spin.log)
+                )
+            except ValueError as e:
+                raise _die(str(e)) from e
+    return resolved
+
+
+def _load_exclude_keys(playlist_ids: list[str]) -> set[str]:
+    """Load cached tracks for each id, return union of normalized keys.
+
+    Dies with a helpful message when any cache is missing.
+    """
+    keys: set[str] = set()
+    for pid in playlist_ids:
+        data = storage.load_json(storage.spotify_path(pid))
+        if data is None:
+            hint = (
+                "chopin fetch spotify"
+                if pid == spotify_mod.LIKED_ID
+                else f"chopin fetch spotify {pid}"
+            )
+            raise _die(
+                f"no cache for exclude playlist {pid!r}. run `{hint}` first."
+            )
+        for t in data.get("tracks", []):
+            keys.add(normalize_key(t["artist"], t["title"]))
+    return keys
+
+
 @app.command()
 def diff(
     playlist: str = typer.Argument(
         "liked",
         help="Playlist URL, URI, ID, name, or 'liked' (default = Liked Songs)",
+    ),
+    min_plays: int = typer.Option(
+        1,
+        "--min-plays",
+        "-m",
+        min=1,
+        help="Drop tracks with fewer than N plays on last.fm (default 1 = no filter).",
+    ),
+    exclude: list[str] = typer.Option(
+        None,
+        "--exclude",
+        "-x",
+        help="Exclude tracks present on another (already fetched) playlist. Repeatable.",
     ),
 ) -> None:
     """Show tracks scrobbled on Last.fm but missing from the playlist."""
@@ -232,19 +296,52 @@ def diff(
                 )
             except ValueError as e:
                 raise _die(str(e)) from e
-    lastfm_tracks, _ = _load_lastfm_or_die()
+
+    lastfm_tracks, has_playcount = _load_lastfm_or_die()
+    if min_plays > 1 and not has_playcount:
+        raise _die(
+            "last.fm cache has no playcount data (legacy format). "
+            "refetch with `chopin fetch lastfm` to use --min-plays."
+        )
+
     _, spotify_tracks = _load_spotify_or_die(playlist_id)
+
+    exclude_ids: list[str] = []
+    if exclude:
+        exclude_ids = _resolve_many_playlists(exclude, spotify_mod.READ_SCOPE)
+    exclude_keys = _load_exclude_keys(exclude_ids) if exclude_ids else set()
+
     missing = diff_tracks(lastfm_tracks, spotify_tracks)
-    typer.echo(
+    filtered = missing
+    dropped_min = 0
+    if min_plays > 1:
+        before = len(filtered)
+        filtered = [t for t in filtered if (t.playcount or 0) >= min_plays]
+        dropped_min = before - len(filtered)
+    dropped_excl = 0
+    if exclude_keys:
+        before = len(filtered)
+        filtered = [
+            t for t in filtered if normalize_key(t.artist, t.title) not in exclude_keys
+        ]
+        dropped_excl = before - len(filtered)
+
+    summary = (
         f"{len(lastfm_tracks)} unique tracks on last.fm, "
         f"{len(spotify_tracks)} on playlist, "
-        f"{len(missing)} missing",
-        err=True,
+        f"{len(missing)} missing"
     )
-    if not missing:
-        typer.echo("nothing missing — playlist covers all your last.fm tracks", err=True)
+    if dropped_min:
+        summary += f", {dropped_min} dropped by --min-plays {min_plays}"
+    if dropped_excl:
+        summary += f", {dropped_excl} dropped by --exclude"
+    summary += f", {len(filtered)} remaining"
+    typer.echo(summary, err=True)
+
+    if not filtered:
+        typer.echo("nothing remaining — all missing tracks filtered out", err=True)
         return
-    for t in missing:
+    for t in filtered:
         typer.echo(f"{t.artist} — {t.title}")
 
 

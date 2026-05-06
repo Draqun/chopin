@@ -64,11 +64,14 @@ fetch-spotify: ## Pull a Spotify playlist (usage: make fetch-spotify [PLAYLIST=<
 		$(CHOPIN) fetch spotify "$(PLAYLIST)"; \
 	fi
 
-diff: ## Show tracks missing from a playlist (usage: make diff [PLAYLIST=<url|uri|id|name>], default = Liked Songs)
-	@if [ -z "$(PLAYLIST)" ]; then \
-		$(CHOPIN) diff; \
+diff: ## Show tracks missing from a playlist (vars: PLAYLIST, MIN_PLAYS, EXCLUDE — for multiple excludes call chopin directly)
+	@args=""; \
+	if [ -n "$(MIN_PLAYS)" ]; then args="$$args --min-plays $(MIN_PLAYS)"; fi; \
+	if [ -n "$(EXCLUDE)" ]; then args="$$args --exclude \"$(EXCLUDE)\""; fi; \
+	if [ -z "$(PLAYLIST)" ]; then \
+		eval "$(CHOPIN) diff $$args"; \
 	else \
-		$(CHOPIN) diff "$(PLAYLIST)"; \
+		eval "$(CHOPIN) diff \"$(PLAYLIST)\" $$args"; \
 	fi
 
 add: ## Interactively add missing tracks (usage: make add PLAYLIST=<url|uri|id>)
