@@ -15,7 +15,7 @@ from chopin.storage import spotify_oauth_cache_path
 
 _PLAYLIST_URL = re.compile(r"open\.spotify\.com/(?:[^/]+/)*playlist/([A-Za-z0-9]+)")
 _PLAYLIST_URI = re.compile(r"spotify:playlist:([A-Za-z0-9]+)")
-_BARE_ID = re.compile(r"^[A-Za-z0-9]{16,}$")
+_BARE_ID = re.compile(r"^[A-Za-z0-9]{22}$")
 
 LIKED_ID = "liked"
 LIKED_ALIASES = {"liked", "saved", "polubione", "ulubione", "liked songs"}
@@ -310,6 +310,61 @@ def add_tracks(
         return
     for i in range(0, len(track_ids), 100):
         client.playlist_add_items(playlist_id, track_ids[i : i + 100])
+
+
+def verify_added(
+    client: spotipy.Spotify, playlist_id: str, track_ids: list[str]
+) -> set[str]:
+    """Return the subset of `track_ids` that are actually present on target.
+
+    Liked Songs: uses `current_user_saved_tracks_contains` (cheap, 50/call).
+    Playlist: fetches the tail of `playlist_items` (added tracks land at the
+    end) and intersects with the expected set. This costs 1 metadata call +
+    ceil(N/100) item calls per verification, so verification should be invoked
+    at flush boundaries, not per-track.
+    """
+    if not track_ids:
+        return set()
+    if playlist_id == LIKED_ID:
+        present: set[str] = set()
+        for i in range(0, len(track_ids), 50):
+            chunk = track_ids[i : i + 50]
+            flags = client.current_user_saved_tracks_contains(chunk)
+            present.update(tid for tid, ok in zip(chunk, flags) if ok)
+        return present
+
+    head = client.playlist_items(
+        playlist_id,
+        limit=1,
+        fields="total",
+        additional_types=("track",),
+    )
+    total = head.get("total", 0)
+    want = set(track_ids)
+    # Look at the tail; pad by 50 for races with concurrent edits.
+    window = len(track_ids) + 50
+    offset = max(total - window, 0)
+    seen: set[str] = set()
+    while offset < total:
+        page = client.playlist_items(
+            playlist_id,
+            offset=offset,
+            limit=100,
+            fields="items(track(id),item(id))",
+            additional_types=("track",),
+        )
+        items = page.get("items") or []
+        if not items:
+            break
+        for item in items:
+            track = item.get("track") or item.get("item")
+            if not track:
+                continue
+            tid = track.get("id")
+            if tid in want:
+                seen.add(tid)
+        offset += len(items)
+    return seen
 
 
 READ_SCOPE = "playlist-read-private user-library-read user-read-private"

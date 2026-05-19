@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 import sys
 import threading
 import time
@@ -214,6 +215,11 @@ _LISTENER_CHECKPOINT_EVERY = 50
 # survives rate limits, network blips, and Ctrl+C. Smaller than the API per-call
 # cap (50 for Liked, 100 for playlists) so failures don't lose a full batch.
 _ADD_FLUSH_EVERY = 25
+
+# jitter between API-hitting iterations to look less bot-like. Spotify has been
+# blocking unattended runs; randomized cadence helps avoid detection.
+_API_SLEEP_MIN_SEC = 0.5
+_API_SLEEP_MAX_SEC = 1.5
 
 # sentinel for cache lookup — None means "no Spotify match" (legitimate, cached);
 # missing key means "never searched, please search".
@@ -703,9 +709,10 @@ def add(
     no_match: list[Track] = []
     errors: list[tuple[Track, str]] = []
     user_skipped: list[Track] = []
+    rate_limit_hit = False
 
     def flush_pending(reason: str) -> None:
-        nonlocal added_total
+        nonlocal added_total, rate_limit_hit
         if not pending:
             return
         new_ids = [tid for tid in pending if tid not in already_pushed]
@@ -718,27 +725,51 @@ def add(
             )
             pending.clear()
             return
+        time.sleep(random.uniform(_API_SLEEP_MIN_SEC, _API_SLEEP_MAX_SEC))
         try:
             spotify_mod.add_tracks(client, playlist_id, new_ids)
         except spotipy.SpotifyException as e:
+            if getattr(e, "http_status", None) == 429:
+                retry_after = (e.headers or {}).get("Retry-After")
+                typer.echo(
+                    f"HARD RATE LIMIT (429) on add. retry-after="
+                    f"{retry_after}s. holding back {len(new_ids)} new tracks "
+                    "for next run; pushed log preserves progress.",
+                    err=True,
+                )
+                rate_limit_hit = True
+                return
             typer.echo(
                 f"flush failed ({len(new_ids)} new tracks held back, "
                 f"will retry on next run): {e}",
                 err=True,
             )
             return
-        already_pushed.update(new_ids)
+        time.sleep(random.uniform(_API_SLEEP_MIN_SEC, _API_SLEEP_MAX_SEC))
+        try:
+            present = spotify_mod.verify_added(client, playlist_id, new_ids)
+        except Exception as e:
+            typer.echo(
+                f"verify failed (assuming all {len(new_ids)} landed): {e}",
+                err=True,
+            )
+            present = set(new_ids)
+        missing = [tid for tid in new_ids if tid not in present]
+        landed = [tid for tid in new_ids if tid in present]
+        already_pushed.update(landed)
         storage.save_json(pushed_path, sorted(already_pushed))
-        added_total += len(new_ids)
+        added_total += len(landed)
         dup_skipped = pending_count - len(new_ids)
         msg = (
-            f"pushed {len(new_ids)} tracks to playlist "
+            f"pushed {len(landed)}/{len(new_ids)} tracks verified on playlist "
             f"({added_total} total — {reason})"
         )
         if dup_skipped:
             msg += f"; {dup_skipped} already pushed earlier, skipped"
+        if missing:
+            msg += f"; {len(missing)} did not land, will retry on next run"
         typer.echo(msg, err=True)
-        pending.clear()
+        pending[:] = missing
         storage.save_json(cache_path, cache)
 
     typer.echo(
@@ -765,6 +796,7 @@ def add(
                         f"{prefix} cached: {t.artist} — {t.title}", err=True
                     )
             else:
+                time.sleep(random.uniform(_API_SLEEP_MIN_SEC, _API_SLEEP_MAX_SEC))
                 typer.echo(
                     f"{prefix} searching: {t.artist} — {t.title}", err=True
                 )
@@ -816,6 +848,12 @@ def add(
 
             if len(pending) >= _ADD_FLUSH_EVERY:
                 flush_pending(f"batch at {i}/{len(selected)}")
+                if rate_limit_hit:
+                    typer.echo(
+                        "aborting run due to add 429 — rerun later",
+                        err=True,
+                    )
+                    break
     except KeyboardInterrupt:
         typer.echo(
             "\ninterrupted — flushing what we have before exiting ...",
